@@ -161,41 +161,41 @@ ctcStatus_t get_workspace_size(const int* const label_lengths,
     int maxL = *std::max_element(label_lengths, label_lengths + minibatch);
     int maxT = *std::max_element(input_lengths, input_lengths + minibatch);
 
-    const int S = 2 * maxL + 1;
-
+    const int S = 2 * maxL + 1; // ab, -a-b-
+    
     *size_bytes = 0;
 
     if (options.loc == CTC_GPU) {
         // GPU storage
         //nll_forward, nll_backward
-        *size_bytes += 2 * sizeof(float) * minibatch;
+        *size_bytes += 2 * sizeof(float) * minibatch; // (B,2)
 
         //repeats
-        *size_bytes += sizeof(int) * minibatch;
+        *size_bytes += sizeof(int) * minibatch; // (B,)
 
         //label offsets
-        *size_bytes += sizeof(int) * minibatch;
+        *size_bytes += sizeof(int) * minibatch; // (B,)
 
         //utt_length
-        *size_bytes += sizeof(int) * minibatch;
+        *size_bytes += sizeof(int) * minibatch; // (B,)
 
         //label lengths
-        *size_bytes += sizeof(int) * minibatch;
+        *size_bytes += sizeof(int) * minibatch; // (B,)
 
         //labels without blanks - overallocate for now
-        *size_bytes += sizeof(int) * maxL * minibatch;
+        *size_bytes += sizeof(int) * maxL * minibatch; // (B, L)
 
         //labels with blanks
-        *size_bytes += sizeof(int) * S * minibatch;
+        *size_bytes += sizeof(int) * S * minibatch; // (B, 2L+1=S)
 
         //alphas
-        *size_bytes += sizeof(float) * S * maxT * minibatch;
+        *size_bytes += sizeof(float) * S * maxT * minibatch; // (B, T, S)
 
         //denoms
-        *size_bytes += sizeof(float) * maxT * minibatch;
+        *size_bytes += sizeof(float) * maxT * minibatch; // (B, T)
 
         //probs (since we will pass in activations)
-        *size_bytes += sizeof(float) * alphabet_size * maxT * minibatch;
+        *size_bytes += sizeof(float) * alphabet_size * maxT * minibatch; // (B, T, V)
 
     } else {
         //cpu can eventually replace all minibatch with
@@ -205,22 +205,23 @@ ctcStatus_t get_workspace_size(const int* const label_lengths,
         //per minibatch memory
         size_t per_minibatch_bytes = 0;
 
-        //output
+        //output, (V,)
         per_minibatch_bytes += sizeof(float) * alphabet_size ;
 
-        //alphas
-        per_minibatch_bytes += sizeof(float) * S * maxT;
+        //alphas, (T, S)
+        per_minibatch_bytes += sizeof(float) * maxT * S;
 
-        //betas
+        //betas, (S,)
         per_minibatch_bytes += sizeof(float) * S;
 
-        //labels w/blanks, e_inc, s_inc
+        //labels w/blanks, e_inc, s_inc, 3 x (S,)
         per_minibatch_bytes += 3 * sizeof(int) * S;
 
+        // minbatch mem count
         *size_bytes = per_minibatch_bytes * minibatch;
 
-        //probs
-        *size_bytes += sizeof(float) * alphabet_size * maxT * minibatch;
+        //probs, (T, B, V)
+        *size_bytes += sizeof(float) * maxT * minibatch * alphabet_size;
     }
 
     return CTC_STATUS_SUCCESS;
@@ -287,22 +288,23 @@ ctcStatus_t get_workspace_size_double(const int* const label_lengths,
         //per minibatch memory
         size_t per_minibatch_bytes = 0;
 
-        //output
+        //output, (V,)
         per_minibatch_bytes += sizeof(double) * alphabet_size ;
 
-        //alphas
-        per_minibatch_bytes += sizeof(double) * S * maxT;
+        //alphas, (T, S)
+        per_minibatch_bytes += sizeof(double) * maxT * S;
 
-        //betas
+        //betas, (S,)
         per_minibatch_bytes += sizeof(double) * S;
 
-        //labels w/blanks, e_inc, s_inc
+        //labels w/blanks, e_inc, s_inc, 3 x (S,)
         per_minibatch_bytes += 3 * sizeof(int) * S;
 
+        // minbatch mem count
         *size_bytes = per_minibatch_bytes * minibatch;
 
-        //probs
-        *size_bytes += sizeof(double) * alphabet_size * maxT * minibatch;
+        //probs, (T, B, V)
+        *size_bytes += sizeof(double) * maxT * minibatch * alphabet_size;
     }
 
     return CTC_STATUS_SUCCESS;

@@ -18,6 +18,9 @@ const int warp_size = 32;
 template<int NT, typename T, typename Rop>
 struct CTAReduce;
 
+// Rop: Reduce OP
+// T: element type
+// NT: num of T elements.
 template<int NT, typename T, typename Rop>
 struct CTAReduce {
     enum { Size = NT, Capacity = NT };
@@ -53,6 +56,11 @@ struct CTAReduce {
     }
 };
 
+// Iop: element/inplace op
+// Rop: Reduce op
+// NT: tile size
+// input: column major mem, (R, C)
+// ouput: (C,), reduce on R axis
 template <int NT, typename Iop, typename Rop, typename T>
 __global__ void reduce_rows(Iop f, Rop g, const T* input, T* output,
                             int num_rows, int num_cols) {
@@ -66,6 +74,7 @@ __global__ void reduce_rows(Iop f, Rop g, const T* input, T* output,
     T curr;
 
     // Each block works on a column
+    // input memory is column major
     if (idx < num_rows)
         curr = f(input[idx + col*num_rows]);
     idx += NT;
