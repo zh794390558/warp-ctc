@@ -251,6 +251,7 @@ CpuCTC<ProbT>::cost_and_grad_kernel(ProbT *grad, const ProbT* const probs,
     // foward and backward loss diff less than 0.1
     bool over_threshold = false;
 
+    // A valid example is one for which L + repeats <= T
     if (L + ctcm.repeats > T) { 
         // L is the label len. 
         // count L with expand blank between repeat label

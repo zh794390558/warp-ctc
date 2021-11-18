@@ -7,6 +7,162 @@
 
 using namespace mgpu;
 
+// Computes forward probabilities. This fills in a T * S matrix.
+// The computation starts at t=1 (2nd row) and ends at t=T-1 (last row). Each row has
+// S elements where S = 2L + 1.
+//
+// We only need to read in probabilities corresponding to the labels, thus a sparse
+// set of values are read from the probs matrix since the character set is much smaller
+// than the labels. This is much more true for Mandarin than English.
+template<typename ProbT, int NT, int VT>
+__global__
+void compute_alpha_kernel (const ProbT* probs, const int *label_sizes,
+                           const int *input_lens, const int *repeats_in_labels,
+                           const int *labels_without_blanks, const int *label_offsets,
+                           int *labels_with_blanks, ProbT *alphas,
+                           ProbT* nll_forward, int stride, int out_dim,
+                           int S_memoffset, int T_memoffset, int blank_label) {
+    // probs, (T, B, V)
+    // alphas, (B, T, S)
+    // label_sizes, (B,)
+    // input_lens, (B,)
+    // repeats_in_labels, (B,)
+    // label_offsets, (B,)
+    // labels_without_blanks, (B,)
+    // labels_with_blanks, (B,)
+    // nll_forward, (B,)
+    // stride = B
+    // out_dim = V
+    // S_memoffset = S
+    // T_memoffset = T
+    // grid_dim = B
+    // block_dim = NT=128
+    // VT=10
+    ctc_helper::log_plus<ProbT> log_plus_f;
+
+    const int tid = threadIdx.x;
+    // b=blockIdx.x example
+    const int L = label_sizes[blockIdx.x]; // label_len
+    const int T = input_lens[blockIdx.x]; // input_len
+    const int S = 2*L + 1;
+    const int prob_offset = blockIdx.x * out_dim; // b * V
+    const int repeats = repeats_in_labels[blockIdx.x];
+
+    const int NV = NT * VT; //shared mem size, NT*VT >= S_
+    __shared__ int label[NV];
+
+    if ((L + repeats) > T) {
+        // invalid example
+        return;
+    }
+
+    // Generate labels with blanks from labels without blanks
+    {
+        const int label_start_offset = label_offsets[blockIdx.x];
+        for (int idx = tid; idx < L; idx += blockDim.x) {
+            const int offset = (blockIdx.x * S_memoffset) + 2 * idx;
+            labels_with_blanks[offset] = blank_label;
+            labels_with_blanks[offset+1] = labels_without_blanks[label_start_offset + idx];
+        }
+        if (tid == 0) {
+            labels_with_blanks[(blockIdx.x * S_memoffset) + 2 * L] = blank_label;
+        }
+    }
+    __syncthreads();
+
+    const int *labels = labels_with_blanks;
+    const int* label_global = &labels[blockIdx.x * S_memoffset];
+    ProbT* alpha = &alphas[blockIdx.x * (T_memoffset * S_memoffset)]; // (1, T, S)
+
+    // Set the first row of alpha neg_inf - it is much more efficient to do it
+    // here than outside
+    #pragma unroll
+    for (int idx = tid; idx < min(S, NV); idx += blockDim.x) {
+        // alpha point to (1, 1, 1)
+        alpha[idx] = ctc_helper::neg_inf<ProbT>();
+    }
+
+    // Load labels into shared memory
+    #pragma unroll
+    for (int i = tid; i < S; i += NT) {
+        label[i] = label_global[i];
+    }
+
+    __syncthreads();
+
+    int start =  (L + repeats < T) ? 0 : 1; // see Line. 124
+    int end = S > 1 ? 2 : 1;
+
+    // Initialize the first row corresponding to t=0;
+    for(int i = tid; i < (end - start); i += blockDim.x)
+        alpha[start + i] = log(probs[prob_offset + label[start + i]]);
+
+    __syncthreads();
+
+    // Fill in the rest of matrix, one row at a time (outer loop).
+    for(int t = 1; t < T; ++t) {
+
+        // Start offsets into the current and previous row
+        const int start_cur_row = t * S;
+        const int start_prev_row = (t - 1) * S;
+
+        // The prob is a 2D row major array, with probabilites for each t strided
+        // by (out_dim * stride), where stride is the minibatch size
+        const int start_prob_col = t * (stride * out_dim);
+
+        // This is the first row and in this case there is nothing left of it
+        if (tid == 0) {
+            if (start == 0) { // start from blank(s=0)
+                alpha[start_cur_row] = alpha[start_prev_row] +
+                                       log(probs[start_prob_col + prob_offset + blank_label]);
+            }
+            else if (start == 1) { // start from l'_1(s=1)
+                alpha[start_cur_row] = alpha[start_prev_row];
+            }
+        }
+
+        __syncthreads();
+
+        // Fill in the elements in each row. There is no loop dependence here since our
+        // input is the row above. We sum either two or three adjacent values from the
+        // row above depending on whether we have a blank or repeated characters. Finally
+        // we add the probability corresponding to this label at time t
+        #pragma unroll
+        for (int idx = (tid+1); idx < S; idx += blockDim.x) {
+
+            ProbT prev_sum = log_plus_f(alpha[start_prev_row + idx], alpha[start_prev_row + (idx-1)]);
+
+            // Skip two if not on blank and not on repeat.
+            if ((label[idx] != blank_label) &&
+                (idx != 1) && (label[idx] != label[idx-2]))
+                prev_sum = log_plus_f(prev_sum, alpha[start_prev_row + (idx-2)]);
+
+            alpha[start_cur_row + idx] =
+                prev_sum + log(probs[start_prob_col + prob_offset + label[idx]]);
+        } // end for idx
+
+        __syncthreads();
+    } // end for t
+
+    if (tid == 0) {
+        // Add and return the rightmost two/one element(s) in the last row.
+        ProbT loglikelihood = ctc_helper::neg_inf<ProbT>();
+
+        // This is the total increment for s_inc and e_inc through the loop
+        const int val = 2 * (L-1) + 1 - (((L + repeats) == T) ? 1 : 0);
+
+        start = (val * (L!=0) + start);
+        end = (val * (L!=0) + end);
+
+        for(int i = start; i < end; ++i)
+            loglikelihood = log_plus_f(loglikelihood, alpha[(T - 1) * S + i]);
+
+        // nll
+        nll_forward[blockIdx.x] = -loglikelihood;
+    }
+}
+
+
 template<int NT, int VT, typename T, typename KeyT, typename Op>
 struct CTASegReduce {
 
@@ -77,143 +233,8 @@ struct CTASegReduce {
     }
 };
 
-// Computes forward probabilities. This fills in a T * S matrix.
-// The computation starts at t=1 (2nd row) and ends at t=T-1 (last row). Each row has
-// S elements where S = 2L + 1.
-//
-// We only need to read in probabilities corresponding to the labels, thus a sparse
-// set of values are read from the probs matrix since the character set is much smaller
-// than the labels. This is much more true for Mandarin than English.
-template<typename ProbT, int NT, int VT>
-__global__
-void compute_alpha_kernel (const ProbT* probs, const int *label_sizes,
-                           const int *utt_length, const int *repeats_in_labels,
-                           const int *labels_without_blanks, const int *label_offsets,
-                           int *labels_with_blanks, ProbT *alphas,
-                           ProbT* nll_forward, int stride, int out_dim,
-                           int S_memoffset, int T_memoffset, int blank_label) {
-
-    ctc_helper::log_plus<ProbT> log_plus_f;
-
-    const int tid = threadIdx.x;
-    const int L = label_sizes[blockIdx.x];
-    const int T = utt_length[blockIdx.x];
-    const int S = 2*L + 1;
-    const int prob_offset = out_dim * blockIdx.x;
-    const int repeats = repeats_in_labels[blockIdx.x];
-
-    const int NV = NT * VT;
-    __shared__ int label[NV];
-
-    if ((L + repeats) > T)
-        return;
-
-    // Generate labels with blanks from labels without blanks
-    {
-        const int label_start_offset = label_offsets[blockIdx.x];
-        for (int idx = tid; idx < L; idx += blockDim.x) {
-            const int offset = (blockIdx.x * S_memoffset) + 2 * idx;
-            labels_with_blanks[offset] = blank_label;
-            labels_with_blanks[offset+1] = labels_without_blanks[label_start_offset + idx];
-        }
-        if (tid == 0) {
-            labels_with_blanks[(blockIdx.x * S_memoffset) + 2 * L] = blank_label;
-        }
-    }
-    __syncthreads();
-
-    const int *labels = labels_with_blanks;
-    const int* label_global = &labels[blockIdx.x * S_memoffset];
-    ProbT* alpha = &alphas[blockIdx.x * (S_memoffset * T_memoffset)];
-
-    // Set the first row of alpha neg_inf - it is much more efficient to do it
-    // here than outside
-    #pragma unroll
-    for (int idx = tid; idx < min(S, NV); idx += blockDim.x) {
-        alpha[idx] = ctc_helper::neg_inf<ProbT>();
-    }
-
-    // Load labels into shared memory
-    #pragma unroll
-    for (int i = tid; i < S; i += NT) {
-        label[i] = label_global[i];
-    }
-
-    __syncthreads();
-
-    int start =  (L + repeats < T) ? 0 : 1;
-    int end = S > 1 ? 2 : 1;
-
-    // Initialize the first row corresponding to t=0;
-    for(int i = tid; i < (end-start); i += blockDim.x)
-        alpha[i + start] = log(probs[prob_offset + label[i + start]]);
-
-    __syncthreads();
-
-    // Fill in the rest of matrix, one row at a time (outer loop).
-    for(int t = 1; t < T; ++t) {
-
-        // Start offsets into the current and previous row
-        const int start_cur_row = t * S;
-        const int start_prev_row = (t - 1) * S;
-
-        // The prob is a 2D column major array, with probabilites for each t strided
-        // by (out_dim * stride), where stride is the minibatch size
-        const int start_prob_col = t * (out_dim * stride);
-
-        // This is the first column and in this case there is nothing left of it
-        if (tid == 0) {
-            if (start == 0) {
-                alpha[start_cur_row] = alpha[start_prev_row] +
-                                       log(probs[prob_offset + start_prob_col + blank_label]);
-            }
-            else if (start == 1) {
-                alpha[start_cur_row] = alpha[start_prev_row];
-            }
-        }
-
-        __syncthreads();
-
-        // Fill in the elements in each row. There is no loop dependence here since our
-        // input is the row above. We sum either two or three adjacent values from the
-        // row above depending on whether we have a blank or repeated characters. Finally
-        // we add the probability corresponding to this label at time t
-        #pragma unroll
-        for (int idx = (tid+1); idx < S; idx += blockDim.x) {
-
-            ProbT prev_sum = log_plus_f(alpha[idx + start_prev_row], alpha[(idx-1) + start_prev_row]);
-
-            // Skip two if not on blank and not on repeat.
-            if ((label[idx] != blank_label) &&
-                (idx != 1) && (label[idx] != label[idx-2]))
-                prev_sum = log_plus_f(prev_sum, alpha[(idx-2) + start_prev_row]);
-
-            alpha[idx + start_cur_row] =
-                prev_sum + log(probs[prob_offset + start_prob_col + label[idx]]);
-        }
-
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        // Add and return the rightmost two/one element(s) in the last row.
-        ProbT loglike = ctc_helper::neg_inf<ProbT>();
-
-        // This is the total increment for s_inc and e_inc through the loop
-        const int val = 2 * (L-1) + 1 - (((L + repeats) == T) ? 1 : 0);
-
-        start = (val * (L!=0) + start);
-        end = (val * (L!=0) + end);
-
-        for(int i = start; i < end; ++i)
-            loglike = log_plus_f(loglike, alpha[i + (T - 1) * S]);
-
-        nll_forward[blockIdx.x] = -loglike;
-    }
-}
 
 // Computes backward probabilities. This also fills in a T * S matrix
-//
 // See comments above compute_alphas for more context.
 template<typename ProbT, int NT, int VT>
 __global__
@@ -451,13 +472,38 @@ void compute_betas_and_grad_kernel (const ProbT* probs, const int *label_sizes,
     }
 }
 
+// probs minus max
 template <typename ProbT, int VT = 1, typename Op>
-__global__ void compute_probs_kernel(Op f, ProbT* probs,
+__global__ void prepare_stable_SM_kernel_probs_minus_max(Op f, ProbT* probs,
+                                         const ProbT* const col_max,
+                                         int alphabet_size,
+                                         int count) {
+    // probs, (T,B,V)
+    // col_max, (T*B,)
+    // alphabet_size, V
+    // count, T*B*V
+    // block_dim, NT=128
+    // grid_dim, count/128
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+#pragma unroll
+    for(int i = 0; i < VT; i++) {
+        if (idx < count) {
+            const int column_idx = idx / alphabet_size;
+            probs[idx] = f(probs[idx] - col_max[column_idx]);
+        }
+        idx += stride;
+    }
+}
+
+// exp probs and  div denom
+template <typename ProbT, int VT = 1, typename Op>
+__global__ void compute_probs_kernel_exp_probs_div_denom(Op f, ProbT* probs,
                                      const ProbT* const denom,
                                      int alphabet_size,
                                      int count) {
 
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
 #pragma unroll
     for(int i = 0; i < VT; i++) {
@@ -469,8 +515,9 @@ __global__ void compute_probs_kernel(Op f, ProbT* probs,
     }
 }
 
+// max(probs, min_T)
 template <typename ProbT, int VT = 1>
-__global__ void truncate_probs_kernel(ProbT* probs, int count) {
+__global__ void clip_min_probs_kernel(ProbT* probs, int count) {
 
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -486,20 +533,3 @@ __global__ void truncate_probs_kernel(ProbT* probs, int count) {
     }
 }
 
-template <typename ProbT, int VT = 1, typename Op>
-__global__ void prepare_stable_SM_kernel(Op f, ProbT* probs,
-                                         const ProbT* const col_max,
-                                         int alphabet_size,
-                                         int count) {
-
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-#pragma unroll
-    for(int i = 0; i < VT; i++) {
-        if (idx < count) {
-            const int column_idx = idx / alphabet_size;
-            probs[idx] = f(probs[idx] - col_max[column_idx]);
-        }
-        idx += stride;
-    }
-}
